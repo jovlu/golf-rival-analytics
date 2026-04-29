@@ -15,6 +15,8 @@ ALLOWED_EVENT_TYPES = {
 }
 
 ALLOWED_DEVICE_OS_VALUES = {"Android", "iOS"}
+ALLOWED_SESSION_PING_STATES = {"started", "in_progress", "ended"}
+SESSION_TIMEOUT_SECONDS = 120
 
 
 def is_valid_registration_event(row, user_id_to_username, seen_usernames):
@@ -50,7 +52,68 @@ def is_valid_registration_event(row, user_id_to_username, seen_usernames):
     return True
 
 
-def is_valid_event(row, user_id_to_username, seen_usernames):
+def has_active_session(user_id, timestamp, active_session_last_ping_timestamp_by_user_id):
+    last_ping_timestamp = active_session_last_ping_timestamp_by_user_id.get(user_id)
+    if last_ping_timestamp is None:
+        return False
+
+    return timestamp - last_ping_timestamp <= SESSION_TIMEOUT_SECONDS
+
+
+def is_valid_session_ping_event(
+    row, user_id_to_username, active_session_last_ping_timestamp_by_user_id
+):
+    user_id = row.get("user_id")
+    if type(user_id) is not str:
+        return False
+
+    if user_id not in user_id_to_username:
+        return False
+
+    event_data = row.get("event_data")
+    if type(event_data) is not dict:
+        return False
+
+    timestamp = row.get("timestamp")
+    if type(timestamp) is not int:
+        return False
+
+    state = event_data.get("state")
+    if state not in ALLOWED_SESSION_PING_STATES:
+        return False
+
+    device_os = event_data.get("device_os")
+    if type(device_os) is not str:
+        return False
+
+    session_is_active = has_active_session(
+        user_id, timestamp, active_session_last_ping_timestamp_by_user_id
+    )
+
+    if not session_is_active:
+        if state != "started":
+            return False
+
+        active_session_last_ping_timestamp_by_user_id[user_id] = timestamp
+        return True
+
+    if state == "started":
+        return False
+
+    if state == "ended":
+        del active_session_last_ping_timestamp_by_user_id[user_id]
+        return True
+
+    active_session_last_ping_timestamp_by_user_id[user_id] = timestamp
+    return True
+
+
+def is_valid_event(
+    row,
+    user_id_to_username,
+    seen_usernames,
+    active_session_last_ping_timestamp_by_user_id,
+):
     if type(row) is not dict:
         return False
 
@@ -61,11 +124,17 @@ def is_valid_event(row, user_id_to_username, seen_usernames):
     if event_type == "registration":
         return is_valid_registration_event(row, user_id_to_username, seen_usernames)
 
+    if event_type == "session_ping":
+        return is_valid_session_ping_event(
+            row, user_id_to_username, active_session_last_ping_timestamp_by_user_id
+        )
+
     return True
 
 
 user_id_to_username = {}
 seen_usernames = set()
+active_session_last_ping_timestamp_by_user_id = {}
 
 with src_file.open("r", encoding="utf-8") as source, dst_file.open(
     "w", encoding="utf-8"
@@ -80,7 +149,12 @@ with src_file.open("r", encoding="utf-8") as source, dst_file.open(
         except json.JSONDecodeError:
             continue
 
-        if not is_valid_event(row, user_id_to_username, seen_usernames):
+        if not is_valid_event(
+            row,
+            user_id_to_username,
+            seen_usernames,
+            active_session_last_ping_timestamp_by_user_id,
+        ):
             continue
 
         output.write(json.dumps(row))
