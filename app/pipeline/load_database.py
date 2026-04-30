@@ -120,13 +120,41 @@ def get_match_pair_key(map_id, user_id, opponent_id):
     return (map_id, opponent_id, user_id)
 
 
+def get_match_outcomes(match_rows, participant_user_ids):
+    outcomes_by_user_id = {}
+
+    for row in match_rows:
+        if row["user_id"] in outcomes_by_user_id:
+            return None
+
+        outcomes_by_user_id[row["user_id"]] = Decimal(str(row["event_data"]["outcome"]))
+
+    participant_user_ids = set(participant_user_ids)
+    if len(outcomes_by_user_id) == 2:
+        if sum(outcomes_by_user_id.values()) != Decimal("1"):
+            return None
+
+    if len(outcomes_by_user_id) == 1:
+        missing_user_ids = participant_user_ids - set(outcomes_by_user_id)
+        if len(missing_user_ids) != 1:
+            return None
+
+        known_outcome = next(iter(outcomes_by_user_id.values()))
+        outcomes_by_user_id[missing_user_ids.pop()] = Decimal("1") - known_outcome
+
+    if set(outcomes_by_user_id) != participant_user_ids:
+        return None
+
+    return outcomes_by_user_id
+
+
 def flush_match_rows(
     match_rows,
     db,
     active_sessions_by_user_id,
     active_matches_by_key,
 ):
-    match_rows_by_key = {}
+    match_rows_by_event_type_and_key = {}
 
     for row in match_rows:
         event_data = row["event_data"]
@@ -135,21 +163,24 @@ def flush_match_rows(
             row["user_id"],
             event_data["opponent_id"],
         )
-        if match_key not in match_rows_by_key:
-            match_rows_by_key[match_key] = []
+        group_key = (row["event_type"], match_key)
+        if group_key not in match_rows_by_event_type_and_key:
+            match_rows_by_event_type_and_key[group_key] = []
 
-        match_rows_by_key[match_key].append(row)
+        match_rows_by_event_type_and_key[group_key].append(row)
 
-    for match_key, pair_rows in match_rows_by_key.items():
-        if len(pair_rows) != 2:
+    sorted_match_groups = sorted(
+        match_rows_by_event_type_and_key.items(),
+        key=lambda item: 0 if item[0][0] == "match_finish" else 1,
+    )
+
+    for (event_type, match_key), pair_rows in sorted_match_groups:
+        if len(pair_rows) < 1 or len(pair_rows) > 2:
             continue
 
-        event_type = pair_rows[0]["event_type"]
         timestamp = to_datetime(pair_rows[0]["timestamp"])
-        first_row = pair_rows[0]
-        second_row = pair_rows[1]
-        first_user_id = first_row["user_id"]
-        second_user_id = second_row["user_id"]
+        map_id, first_user_id, second_user_id = match_key
+        participant_user_ids = (first_user_id, second_user_id)
 
         if event_type == "match_start":
             active_matches_by_key[match_key] = ActiveMatchState(
@@ -173,8 +204,12 @@ def flush_match_rows(
         if active_match is None:
             continue
 
+        outcomes_by_user_id = get_match_outcomes(pair_rows, participant_user_ids)
+        if outcomes_by_user_id is None:
+            continue
+
         match_row = Match(
-            map_id=first_row["event_data"]["map_id"],
+            map_id=map_id,
             started_at=active_match.started_at,
             ended_at=timestamp,
             ended_date=timestamp.date(),
@@ -183,14 +218,13 @@ def flush_match_rows(
         db.add(match_row)
         db.flush()
 
-        for row in pair_rows:
-            user_id = row["user_id"]
+        for user_id in participant_user_ids:
             db.add(
                 MatchParticipation(
                     match_id=match_row.match_id,
                     user_id=user_id,
                     session_id=active_match.participant_session_ids.get(user_id),
-                    outcome=Decimal(str(row["event_data"]["outcome"])),
+                    outcome=outcomes_by_user_id[user_id],
                 )
             )
 

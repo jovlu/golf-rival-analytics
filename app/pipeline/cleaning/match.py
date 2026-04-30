@@ -42,6 +42,37 @@ def make_active_match_key(map_id, user_id, opponent_id):
     return (map_id, opponent_id, user_id)
 
 
+def get_match_participant_user_ids(match_rows):
+    if len(match_rows) < 1 or len(match_rows) > 2:
+        return None
+
+    first_row = match_rows[0]
+    first_user_id = first_row["user_id"]
+    second_user_id = first_row["opponent_id"]
+    participant_user_ids = {first_user_id, second_user_id}
+
+    if first_user_id == second_user_id:
+        return None
+
+    row_user_ids = set()
+    for row in match_rows:
+        if row["event_type"] != first_row["event_type"]:
+            return None
+
+        if row["map_id"] != first_row["map_id"]:
+            return None
+
+        if {row["user_id"], row["opponent_id"]} != participant_user_ids:
+            return None
+
+        if row["user_id"] in row_user_ids:
+            return None
+
+        row_user_ids.add(row["user_id"])
+
+    return first_user_id, second_user_id
+
+
 def is_valid_match_pair(
     match_rows,
     match_row_count_by_event_type_and_user_id,
@@ -50,113 +81,80 @@ def is_valid_match_pair(
     ending_session_user_ids,
     user_id_to_username,
 ):
-    if len(match_rows) != 2:
+    participant_user_ids = get_match_participant_user_ids(match_rows)
+    if participant_user_ids is None:
         return False
 
+    first_user_id, second_user_id = participant_user_ids
     first_row = match_rows[0]
-    second_row = match_rows[1]
-
-    if first_row["user_id"] == second_row["user_id"]:
-        return False
-
-    if first_row["user_id"] not in user_id_to_username:
-        return False
-
-    if second_row["user_id"] not in user_id_to_username:
-        return False
-
     event_type = first_row["event_type"]
+    map_id = first_row["map_id"]
 
-    if match_row_count_by_event_type_and_user_id.get(
-        (event_type, first_row["user_id"])
-    ) != 1:
-        return False
-
-    if match_row_count_by_event_type_and_user_id.get(
-        (event_type, second_row["user_id"])
-    ) != 1:
-        return False
-
-    if first_row["opponent_id"] != second_row["user_id"]:
-        return False
-
-    if second_row["opponent_id"] != first_row["user_id"]:
-        return False
-
-    if first_row["event_type"] == "match_start":
-        if first_row["user_id"] in ending_session_user_ids:
+    for row in match_rows:
+        if match_row_count_by_event_type_and_user_id.get(
+            (event_type, row["user_id"])
+        ) != 1:
             return False
 
-        if second_row["user_id"] in ending_session_user_ids:
+    for user_id in participant_user_ids:
+        if user_id not in user_id_to_username:
             return False
 
+    if event_type == "match_start":
+        for user_id in participant_user_ids:
+            if user_id in ending_session_user_ids:
+                return False
+
+            if not has_active_session(
+                user_id,
+                first_row["timestamp"],
+                active_session_last_ping_timestamp_by_user_id,
+            ):
+                return False
+
+            if user_id in active_match_by_user_id:
+                return False
+
+        return True
+
+    if len(match_rows) == 2 and match_rows[0]["outcome"] + match_rows[1]["outcome"] != 1:
+        return False
+
+    for user_id in participant_user_ids:
         if not has_active_session(
-            first_row["user_id"],
+            user_id,
             first_row["timestamp"],
             active_session_last_ping_timestamp_by_user_id,
         ):
             return False
 
-        if not has_active_session(
-            second_row["user_id"],
-            second_row["timestamp"],
-            active_session_last_ping_timestamp_by_user_id,
-        ):
-            return False
-
-        if first_row["user_id"] in active_match_by_user_id:
-            return False
-
-        if second_row["user_id"] in active_match_by_user_id:
-            return False
-
-        return True
-
-    if first_row["outcome"] + second_row["outcome"] != 1:
+    if active_match_by_user_id.get(first_user_id) != (second_user_id, map_id):
         return False
 
-    if not has_active_session(
-        first_row["user_id"],
-        first_row["timestamp"],
-        active_session_last_ping_timestamp_by_user_id,
-    ):
-        return False
-
-    if not has_active_session(
-        second_row["user_id"],
-        second_row["timestamp"],
-        active_session_last_ping_timestamp_by_user_id,
-    ):
-        return False
-
-    first_active_match = active_match_by_user_id.get(first_row["user_id"])
-    if first_active_match != (first_row["opponent_id"], first_row["map_id"]):
-        return False
-
-    second_active_match = active_match_by_user_id.get(second_row["user_id"])
-    if second_active_match != (second_row["opponent_id"], second_row["map_id"]):
+    if active_match_by_user_id.get(second_user_id) != (first_user_id, map_id):
         return False
 
     return True
 
 
 def apply_match_pair(match_rows, active_match_by_user_id):
+    first_user_id, second_user_id = get_match_participant_user_ids(match_rows)
     first_row = match_rows[0]
-    second_row = match_rows[1]
+    map_id = first_row["map_id"]
 
     if first_row["event_type"] == "match_start":
-        active_match_by_user_id[first_row["user_id"]] = (
-            first_row["opponent_id"],
-            first_row["map_id"],
+        active_match_by_user_id[first_user_id] = (
+            second_user_id,
+            map_id,
         )
-        active_match_by_user_id[second_row["user_id"]] = (
-            second_row["opponent_id"],
-            second_row["map_id"],
+        active_match_by_user_id[second_user_id] = (
+            first_user_id,
+            map_id,
         )
         return
 
-    del active_match_by_user_id[first_row["user_id"]]
-    del active_match_by_user_id[second_row["user_id"]]
+    active_match_by_user_id.pop(first_user_id, None)
+    active_match_by_user_id.pop(second_user_id, None)
 
 
 def discard_active_match_for_user(
