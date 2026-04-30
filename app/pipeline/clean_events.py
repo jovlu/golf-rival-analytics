@@ -167,7 +167,12 @@ def make_match_pair_key(event_type, map_id, user_id, opponent_id):
     return (event_type, map_id, opponent_id, user_id)
 
 
-def is_valid_match_pair(match_rows, match_row_count_by_user_id, active_match_by_user_id):
+def is_valid_match_pair(
+    match_rows,
+    match_row_count_by_user_id,
+    active_match_by_user_id,
+    user_id_to_username,
+):
     if len(match_rows) != 2:
         return False
 
@@ -175,6 +180,12 @@ def is_valid_match_pair(match_rows, match_row_count_by_user_id, active_match_by_
     second_row = match_rows[1]
 
     if first_row["user_id"] == second_row["user_id"]:
+        return False
+
+    if first_row["user_id"] not in user_id_to_username:
+        return False
+
+    if second_row["user_id"] not in user_id_to_username:
         return False
 
     if match_row_count_by_user_id.get(first_row["user_id"]) != 1:
@@ -307,7 +318,10 @@ def write_valid_rows_for_timestamp_group(
 
     for match_rows in match_rows_by_key.values():
         if not is_valid_match_pair(
-            match_rows, match_row_count_by_user_id, active_match_by_user_id
+            match_rows,
+            match_row_count_by_user_id,
+            active_match_by_user_id,
+            user_id_to_username,
         ):
             continue
 

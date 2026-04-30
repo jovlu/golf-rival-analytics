@@ -77,6 +77,7 @@ def process_registration(row, db):
             registered_at=to_datetime(row["timestamp"]),
         )
     )
+    db.flush()
 
 
 def process_session_ping(row, db, active_sessions_by_user_id):
