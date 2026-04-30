@@ -1,12 +1,8 @@
 import json
 from pathlib import Path
 
+from app.pipeline.paths import CLEANED_EVENTS_FILE, DEDUPED_EVENTS_FILE, MAPS_FILE
 
-project_root = Path(__file__).resolve().parent.parent
-
-src_file = project_root / "events.deduped.jsonl"
-dst_file = project_root / "events.cleaned.jsonl"
-maps_file = project_root / "maps.jsonl"
 
 ALLOWED_EVENT_TYPES = {
     "registration",
@@ -21,7 +17,7 @@ ALLOWED_MATCH_OUTCOMES = {0, 0.5, 1}
 SESSION_TIMEOUT_SECONDS = 120
 
 
-def load_valid_map_ids():
+def load_valid_map_ids(maps_file: Path = MAPS_FILE):
     valid_map_ids = set()
 
     with maps_file.open("r", encoding="utf-8") as source:
@@ -326,61 +322,70 @@ def write_valid_rows_for_timestamp_group(
             output.write("\n")
 
 
-user_id_to_username = {}
-seen_usernames = set()
-active_session_last_ping_timestamp_by_user_id = {}
-valid_map_ids = load_valid_map_ids()
-active_match_by_user_id = {}
-have_current_timestamp = False
+def clean_events_jsonl(
+    src_file: Path = DEDUPED_EVENTS_FILE,
+    dst_file: Path = CLEANED_EVENTS_FILE,
+    maps_file: Path = MAPS_FILE,
+):
+    user_id_to_username = {}
+    seen_usernames = set()
+    active_session_last_ping_timestamp_by_user_id = {}
+    valid_map_ids = load_valid_map_ids(maps_file)
+    active_match_by_user_id = {}
+    have_current_timestamp = False
 
-with src_file.open("r", encoding="utf-8") as source, dst_file.open(
-    "w", encoding="utf-8"
-) as output:
-    current_timestamp = None
-    current_timestamp_rows = []
+    with src_file.open("r", encoding="utf-8") as source, dst_file.open(
+        "w", encoding="utf-8"
+    ) as output:
+        current_timestamp = None
+        current_timestamp_rows = []
 
-    for line in source:
-        stripped_line = line.strip()
-        if stripped_line == "":
-            continue
+        for line in source:
+            stripped_line = line.strip()
+            if stripped_line == "":
+                continue
 
-        try:
-            row = json.loads(stripped_line)
-        except json.JSONDecodeError:
-            continue
+            try:
+                row = json.loads(stripped_line)
+            except json.JSONDecodeError:
+                continue
 
-        row_timestamp = row.get("timestamp") if type(row) is dict else None
+            row_timestamp = row.get("timestamp") if type(row) is dict else None
 
-        if not have_current_timestamp:
+            if not have_current_timestamp:
+                current_timestamp = row_timestamp
+                current_timestamp_rows.append(row)
+                have_current_timestamp = True
+                continue
+
+            if row_timestamp == current_timestamp:
+                current_timestamp_rows.append(row)
+                continue
+
+            write_valid_rows_for_timestamp_group(
+                current_timestamp_rows,
+                output,
+                user_id_to_username,
+                seen_usernames,
+                active_session_last_ping_timestamp_by_user_id,
+                valid_map_ids,
+                active_match_by_user_id,
+            )
+
             current_timestamp = row_timestamp
-            current_timestamp_rows.append(row)
-            have_current_timestamp = True
-            continue
+            current_timestamp_rows = [row]
 
-        if row_timestamp == current_timestamp:
-            current_timestamp_rows.append(row)
-            continue
+        if current_timestamp_rows:
+            write_valid_rows_for_timestamp_group(
+                current_timestamp_rows,
+                output,
+                user_id_to_username,
+                seen_usernames,
+                active_session_last_ping_timestamp_by_user_id,
+                valid_map_ids,
+                active_match_by_user_id,
+            )
 
-        write_valid_rows_for_timestamp_group(
-            current_timestamp_rows,
-            output,
-            user_id_to_username,
-            seen_usernames,
-            active_session_last_ping_timestamp_by_user_id,
-            valid_map_ids,
-            active_match_by_user_id,
-        )
 
-        current_timestamp = row_timestamp
-        current_timestamp_rows = [row]
-
-    if current_timestamp_rows:
-        write_valid_rows_for_timestamp_group(
-            current_timestamp_rows,
-            output,
-            user_id_to_username,
-            seen_usernames,
-            active_session_last_ping_timestamp_by_user_id,
-            valid_map_ids,
-            active_match_by_user_id,
-        )
+if __name__ == "__main__":
+    clean_events_jsonl()

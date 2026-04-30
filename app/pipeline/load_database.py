@@ -8,11 +8,9 @@ from sqlalchemy import select
 
 from app.db import Base, SessionLocal, engine
 from app.models import GameMap, Match, MatchParticipation, Session, User
+from app.pipeline.paths import CLEANED_EVENTS_FILE, MAPS_FILE
 
 
-project_root = Path(__file__).resolve().parent.parent
-cleaned_events_file = project_root / "events.cleaned.jsonl"
-maps_file = project_root / "maps.jsonl"
 SESSION_TIMEOUT_SECONDS = 120
 
 
@@ -32,7 +30,7 @@ def to_datetime(timestamp):
     return datetime.fromtimestamp(timestamp, tz=timezone.utc)
 
 
-def load_jsonl_rows(file_path):
+def load_jsonl_rows(file_path: Path):
     with file_path.open("r", encoding="utf-8") as source:
         for line in source:
             stripped_line = line.strip()
@@ -59,7 +57,7 @@ def ensure_database_is_empty(db):
         raise RuntimeError("match_participations table is not empty")
 
 
-def load_maps(db):
+def load_maps(db, maps_file: Path = MAPS_FILE):
     for row in load_jsonl_rows(maps_file):
         db.add(
             GameMap(
@@ -277,7 +275,7 @@ def process_timestamp_group(
         )
 
 
-def load_cleaned_events(db):
+def load_cleaned_events(db, cleaned_events_file: Path = CLEANED_EVENTS_FILE):
     active_sessions_by_user_id = {}
     active_matches_by_key = {}
     current_timestamp = None
@@ -318,7 +316,7 @@ def load_cleaned_events(db):
     close_remaining_active_sessions(active_sessions_by_user_id)
 
 
-def main():
+def load_db():
     Base.metadata.create_all(bind=engine)
 
     with SessionLocal.begin() as db:
@@ -328,4 +326,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    load_db()
