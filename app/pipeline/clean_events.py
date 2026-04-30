@@ -2,7 +2,15 @@ import json
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, StrictInt, StrictStr, ValidationError
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    StrictFloat,
+    StrictInt,
+    StrictStr,
+    ValidationError,
+    field_validator,
+)
 
 from app.pipeline.paths import CLEANED_EVENTS_FILE, DEDUPED_EVENTS_FILE, MAPS_FILE
 
@@ -62,7 +70,15 @@ class MatchStartEvent(StrictEventModel):
 
 
 class MatchFinishEventData(MatchStartEventData):
-    outcome: Literal[0, 0.5, 1]
+    outcome: StrictInt | StrictFloat
+
+    @field_validator("outcome")
+    @classmethod
+    def validate_outcome(cls, outcome):
+        if outcome not in {0, 0.5, 1}:
+            raise ValueError("outcome must be 0, 0.5, or 1")
+
+        return outcome
 
 
 class MatchFinishEvent(StrictEventModel):
@@ -178,11 +194,16 @@ def get_match_event_info(row, valid_map_ids):
     if event.event_data.map_id not in valid_map_ids:
         return None
 
-    return {
+    match_info = {
         "user_id": event.user_id,
         "opponent_id": event.event_data.opponent_id,
         "map_id": event.event_data.map_id,
     }
+
+    if event.event_type == "match_finish":
+        match_info["outcome"] = event.event_data.outcome
+
+    return match_info
 
 
 def make_match_pair_key(event_type, map_id, user_id, opponent_id):
@@ -196,6 +217,7 @@ def is_valid_match_pair(
     match_rows,
     match_row_count_by_user_id,
     active_match_by_user_id,
+    active_session_last_ping_timestamp_by_user_id,
     user_id_to_username,
 ):
     if len(match_rows) != 2:
@@ -226,6 +248,12 @@ def is_valid_match_pair(
         return False
 
     if first_row["event_type"] == "match_start":
+        if first_row["user_id"] not in active_session_last_ping_timestamp_by_user_id:
+            return False
+
+        if second_row["user_id"] not in active_session_last_ping_timestamp_by_user_id:
+            return False
+
         if first_row["user_id"] in active_match_by_user_id:
             return False
 
@@ -233,6 +261,9 @@ def is_valid_match_pair(
             return False
 
         return True
+
+    if first_row["outcome"] + second_row["outcome"] != 1:
+        return False
 
     first_active_match = active_match_by_user_id.get(first_row["user_id"])
     if first_active_match != (first_row["opponent_id"], first_row["map_id"]):
@@ -343,6 +374,7 @@ def write_valid_rows_for_timestamp_group(
             match_rows,
             match_row_count_by_user_id,
             active_match_by_user_id,
+            active_session_last_ping_timestamp_by_user_id,
             user_id_to_username,
         ):
             continue
