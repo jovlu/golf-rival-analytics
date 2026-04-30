@@ -213,9 +213,16 @@ def make_match_pair_key(event_type, map_id, user_id, opponent_id):
     return (event_type, map_id, opponent_id, user_id)
 
 
+def make_active_match_key(map_id, user_id, opponent_id):
+    if user_id < opponent_id:
+        return (map_id, user_id, opponent_id)
+
+    return (map_id, opponent_id, user_id)
+
+
 def is_valid_match_pair(
     match_rows,
-    match_row_count_by_user_id,
+    match_row_count_by_event_type_and_user_id,
     active_match_by_user_id,
     active_session_last_ping_timestamp_by_user_id,
     ending_session_user_ids,
@@ -236,10 +243,16 @@ def is_valid_match_pair(
     if second_row["user_id"] not in user_id_to_username:
         return False
 
-    if match_row_count_by_user_id.get(first_row["user_id"]) != 1:
+    event_type = first_row["event_type"]
+
+    if match_row_count_by_event_type_and_user_id.get(
+        (event_type, first_row["user_id"])
+    ) != 1:
         return False
 
-    if match_row_count_by_user_id.get(second_row["user_id"]) != 1:
+    if match_row_count_by_event_type_and_user_id.get(
+        (event_type, second_row["user_id"])
+    ) != 1:
         return False
 
     if first_row["opponent_id"] != second_row["user_id"]:
@@ -324,21 +337,99 @@ def apply_match_pair(match_rows, active_match_by_user_id):
     del active_match_by_user_id[second_row["user_id"]]
 
 
-def write_valid_rows_for_timestamp_group(
-    rows,
-    output,
+def discard_active_match_for_user(
+    user_id,
+    active_match_by_user_id,
+    pending_matches_by_key,
+):
+    active_match = active_match_by_user_id.pop(user_id, None)
+    if active_match is None:
+        return
+
+    opponent_id, map_id = active_match
+    active_match_key = make_active_match_key(map_id, user_id, opponent_id)
+    pending_matches_by_key.pop(active_match_key, None)
+
+    if active_match_by_user_id.get(opponent_id) == (user_id, map_id):
+        del active_match_by_user_id[opponent_id]
+
+
+def discard_inactive_matches(
+    active_match_by_user_id,
+    pending_matches_by_key,
+    active_session_last_ping_timestamp_by_user_id,
+    current_timestamp,
+):
+    for user_id in list(active_match_by_user_id):
+        active_match = active_match_by_user_id.get(user_id)
+        if active_match is None:
+            continue
+
+        opponent_id, _ = active_match
+        if not has_active_session(
+            user_id,
+            current_timestamp,
+            active_session_last_ping_timestamp_by_user_id,
+        ) or not has_active_session(
+            opponent_id,
+            current_timestamp,
+            active_session_last_ping_timestamp_by_user_id,
+        ):
+            discard_active_match_for_user(
+                user_id, active_match_by_user_id, pending_matches_by_key
+            )
+
+
+def get_output_priority(row):
+    event_type = row.get("event_type") if type(row) is dict else None
+    if event_type == "registration":
+        return 0
+
+    if event_type == "session_ping":
+        event_data = row.get("event_data")
+        if type(event_data) is dict and event_data.get("state") == "ended":
+            return 4
+
+        return 1
+
+    if event_type == "match_finish":
+        return 2
+
+    if event_type == "match_start":
+        return 3
+
+    return 5
+
+
+def collect_valid_row_indexes_for_timestamp_group(
+    row_items,
+    valid_row_indexes,
     user_id_to_username,
     seen_usernames,
     active_session_last_ping_timestamp_by_user_id,
     valid_map_ids,
     active_match_by_user_id,
+    pending_matches_by_key,
 ):
-    valid_row_indexes = set()
     match_rows_by_key = {}
-    match_row_count_by_user_id = {}
+    match_row_count_by_event_type_and_user_id = {}
     ending_session_user_ids = set()
 
-    for row_index, row in enumerate(rows):
+    current_timestamp = None
+    for _, row in row_items:
+        if type(row) is dict and type(row.get("timestamp")) is int:
+            current_timestamp = row["timestamp"]
+            break
+
+    if current_timestamp is not None:
+        discard_inactive_matches(
+            active_match_by_user_id,
+            pending_matches_by_key,
+            active_session_last_ping_timestamp_by_user_id,
+            current_timestamp,
+        )
+
+    for row_index, row in row_items:
         event_type = row.get("event_type") if type(row) is dict else None
 
         if event_type != "registration":
@@ -347,7 +438,7 @@ def write_valid_rows_for_timestamp_group(
         if is_valid_registration_event(row, user_id_to_username, seen_usernames):
             valid_row_indexes.add(row_index)
 
-    for row_index, row in enumerate(rows):
+    for row_index, row in row_items:
         event_type = row.get("event_type") if type(row) is dict else None
 
         if event_type != "session_ping":
@@ -361,7 +452,7 @@ def write_valid_rows_for_timestamp_group(
         ):
             valid_row_indexes.add(row_index)
 
-    for row_index, row in enumerate(rows):
+    for row_index, row in row_items:
         event_type = row.get("event_type") if type(row) is dict else None
 
         if event_type != "match_start" and event_type != "match_finish":
@@ -369,8 +460,9 @@ def write_valid_rows_for_timestamp_group(
 
         user_id = row.get("user_id")
         if type(user_id) is str:
-            match_row_count_by_user_id[user_id] = (
-                match_row_count_by_user_id.get(user_id, 0) + 1
+            count_key = (event_type, user_id)
+            match_row_count_by_event_type_and_user_id[count_key] = (
+                match_row_count_by_event_type_and_user_id.get(count_key, 0) + 1
             )
 
         match_info = get_match_event_info(row, valid_map_ids)
@@ -391,10 +483,15 @@ def write_valid_rows_for_timestamp_group(
 
         match_rows_by_key[match_key].append(match_info)
 
-    for match_rows in match_rows_by_key.values():
+    sorted_match_groups = sorted(
+        match_rows_by_key.values(),
+        key=lambda match_rows: 0 if match_rows[0]["event_type"] == "match_finish" else 1,
+    )
+
+    for match_rows in sorted_match_groups:
         if not is_valid_match_pair(
             match_rows,
-            match_row_count_by_user_id,
+            match_row_count_by_event_type_and_user_id,
             active_match_by_user_id,
             active_session_last_ping_timestamp_by_user_id,
             ending_session_user_ids,
@@ -402,18 +499,33 @@ def write_valid_rows_for_timestamp_group(
         ):
             continue
 
-        apply_match_pair(match_rows, active_match_by_user_id)
+        active_match_key = make_active_match_key(
+            match_rows[0]["map_id"],
+            match_rows[0]["user_id"],
+            match_rows[0]["opponent_id"],
+        )
 
+        if match_rows[0]["event_type"] == "match_start":
+            apply_match_pair(match_rows, active_match_by_user_id)
+            pending_matches_by_key[active_match_key] = [
+                match_row["row_index"] for match_row in match_rows
+            ]
+            continue
+
+        pending_start_row_indexes = pending_matches_by_key.pop(active_match_key, None)
+        if pending_start_row_indexes is None:
+            continue
+
+        apply_match_pair(match_rows, active_match_by_user_id)
+        valid_row_indexes.update(pending_start_row_indexes)
         for match_row in match_rows:
             valid_row_indexes.add(match_row["row_index"])
 
     for user_id in ending_session_user_ids:
+        discard_active_match_for_user(
+            user_id, active_match_by_user_id, pending_matches_by_key
+        )
         active_session_last_ping_timestamp_by_user_id.pop(user_id, None)
-
-    for row_index, row in enumerate(rows):
-        if row_index in valid_row_indexes:
-            output.write(json.dumps(row))
-            output.write("\n")
 
 
 def clean_events_jsonl(
@@ -426,11 +538,12 @@ def clean_events_jsonl(
     active_session_last_ping_timestamp_by_user_id = {}
     valid_map_ids = load_valid_map_ids(maps_file)
     active_match_by_user_id = {}
+    pending_matches_by_key = {}
+    valid_row_indexes = set()
+    rows = []
     have_current_timestamp = False
 
-    with src_file.open("r", encoding="utf-8") as source, dst_file.open(
-        "w", encoding="utf-8"
-    ) as output:
+    with src_file.open("r", encoding="utf-8") as source:
         current_timestamp = None
         current_timestamp_rows = []
 
@@ -444,41 +557,60 @@ def clean_events_jsonl(
             except json.JSONDecodeError:
                 continue
 
+            row_index = len(rows)
+            rows.append(row)
             row_timestamp = row.get("timestamp") if type(row) is dict else None
+            row_item = (row_index, row)
 
             if not have_current_timestamp:
                 current_timestamp = row_timestamp
-                current_timestamp_rows.append(row)
+                current_timestamp_rows.append(row_item)
                 have_current_timestamp = True
                 continue
 
             if row_timestamp == current_timestamp:
-                current_timestamp_rows.append(row)
+                current_timestamp_rows.append(row_item)
                 continue
 
-            write_valid_rows_for_timestamp_group(
+            collect_valid_row_indexes_for_timestamp_group(
                 current_timestamp_rows,
-                output,
+                valid_row_indexes,
                 user_id_to_username,
                 seen_usernames,
                 active_session_last_ping_timestamp_by_user_id,
                 valid_map_ids,
                 active_match_by_user_id,
+                pending_matches_by_key,
             )
 
             current_timestamp = row_timestamp
-            current_timestamp_rows = [row]
+            current_timestamp_rows = [row_item]
 
         if current_timestamp_rows:
-            write_valid_rows_for_timestamp_group(
+            collect_valid_row_indexes_for_timestamp_group(
                 current_timestamp_rows,
-                output,
+                valid_row_indexes,
                 user_id_to_username,
                 seen_usernames,
                 active_session_last_ping_timestamp_by_user_id,
                 valid_map_ids,
                 active_match_by_user_id,
+                pending_matches_by_key,
             )
+
+    sorted_valid_row_indexes = sorted(
+        valid_row_indexes,
+        key=lambda row_index: (
+            rows[row_index].get("timestamp") if type(rows[row_index]) is dict else 0,
+            get_output_priority(rows[row_index]),
+            row_index,
+        ),
+    )
+
+    with dst_file.open("w", encoding="utf-8") as output:
+        for row_index in sorted_valid_row_indexes:
+            output.write(json.dumps(rows[row_index]))
+            output.write("\n")
 
 
 if __name__ == "__main__":
