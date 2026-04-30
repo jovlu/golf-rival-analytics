@@ -75,3 +75,4 @@ Open:
 - API root: http://127.0.0.1:8000/
 - Health check: http://127.0.0.1:8000/health
 - Swagger docs: http://127.0.0.1:8000/docs
+- Chart http://127.0.0.1:8000/map-stats-chart
