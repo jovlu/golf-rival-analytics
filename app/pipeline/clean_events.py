@@ -15,13 +15,6 @@ from pydantic import (
 from app.pipeline.paths import CLEANED_EVENTS_FILE, DEDUPED_EVENTS_FILE, MAPS_FILE
 
 
-ALLOWED_EVENT_TYPES = {
-    "registration",
-    "session_ping",
-    "match_start",
-    "match_finish",
-}
-
 SESSION_TIMEOUT_SECONDS = 120
 
 
@@ -148,7 +141,10 @@ def has_active_session(user_id, timestamp, active_session_last_ping_timestamp_by
 
 
 def is_valid_session_ping_event(
-    row, user_id_to_username, active_session_last_ping_timestamp_by_user_id
+    row,
+    user_id_to_username,
+    active_session_last_ping_timestamp_by_user_id,
+    ending_session_user_ids=None,
 ):
     event = parse_event(row, SessionPingEvent)
     if event is None:
@@ -174,7 +170,10 @@ def is_valid_session_ping_event(
         return False
 
     if event.event_data.state == "ended":
-        del active_session_last_ping_timestamp_by_user_id[event.user_id]
+        if ending_session_user_ids is None:
+            del active_session_last_ping_timestamp_by_user_id[event.user_id]
+        else:
+            ending_session_user_ids.add(event.user_id)
         return True
 
     active_session_last_ping_timestamp_by_user_id[event.user_id] = event.timestamp
@@ -198,6 +197,7 @@ def get_match_event_info(row, valid_map_ids):
         "user_id": event.user_id,
         "opponent_id": event.event_data.opponent_id,
         "map_id": event.event_data.map_id,
+        "timestamp": event.timestamp,
     }
 
     if event.event_type == "match_finish":
@@ -218,6 +218,7 @@ def is_valid_match_pair(
     match_row_count_by_user_id,
     active_match_by_user_id,
     active_session_last_ping_timestamp_by_user_id,
+    ending_session_user_ids,
     user_id_to_username,
 ):
     if len(match_rows) != 2:
@@ -248,10 +249,24 @@ def is_valid_match_pair(
         return False
 
     if first_row["event_type"] == "match_start":
-        if first_row["user_id"] not in active_session_last_ping_timestamp_by_user_id:
+        if first_row["user_id"] in ending_session_user_ids:
             return False
 
-        if second_row["user_id"] not in active_session_last_ping_timestamp_by_user_id:
+        if second_row["user_id"] in ending_session_user_ids:
+            return False
+
+        if not has_active_session(
+            first_row["user_id"],
+            first_row["timestamp"],
+            active_session_last_ping_timestamp_by_user_id,
+        ):
+            return False
+
+        if not has_active_session(
+            second_row["user_id"],
+            second_row["timestamp"],
+            active_session_last_ping_timestamp_by_user_id,
+        ):
             return False
 
         if first_row["user_id"] in active_match_by_user_id:
@@ -263,6 +278,20 @@ def is_valid_match_pair(
         return True
 
     if first_row["outcome"] + second_row["outcome"] != 1:
+        return False
+
+    if not has_active_session(
+        first_row["user_id"],
+        first_row["timestamp"],
+        active_session_last_ping_timestamp_by_user_id,
+    ):
+        return False
+
+    if not has_active_session(
+        second_row["user_id"],
+        second_row["timestamp"],
+        active_session_last_ping_timestamp_by_user_id,
+    ):
         return False
 
     first_active_match = active_match_by_user_id.get(first_row["user_id"])
@@ -295,30 +324,6 @@ def apply_match_pair(match_rows, active_match_by_user_id):
     del active_match_by_user_id[second_row["user_id"]]
 
 
-def is_valid_event(
-    row,
-    user_id_to_username,
-    seen_usernames,
-    active_session_last_ping_timestamp_by_user_id,
-):
-    if type(row) is not dict:
-        return False
-
-    event_type = row.get("event_type")
-    if event_type not in ALLOWED_EVENT_TYPES:
-        return False
-
-    if event_type == "registration":
-        return is_valid_registration_event(row, user_id_to_username, seen_usernames)
-
-    if event_type == "session_ping":
-        return is_valid_session_ping_event(
-            row, user_id_to_username, active_session_last_ping_timestamp_by_user_id
-        )
-
-    return False
-
-
 def write_valid_rows_for_timestamp_group(
     rows,
     output,
@@ -331,43 +336,60 @@ def write_valid_rows_for_timestamp_group(
     valid_row_indexes = set()
     match_rows_by_key = {}
     match_row_count_by_user_id = {}
+    ending_session_user_ids = set()
 
     for row_index, row in enumerate(rows):
         event_type = row.get("event_type") if type(row) is dict else None
 
-        if event_type == "match_start" or event_type == "match_finish":
-            user_id = row.get("user_id")
-            if type(user_id) is str:
-                match_row_count_by_user_id[user_id] = (
-                    match_row_count_by_user_id.get(user_id, 0) + 1
-                )
-
-            match_info = get_match_event_info(row, valid_map_ids)
-            if match_info is None:
-                continue
-
-            match_info["event_type"] = event_type
-            match_info["row_index"] = row_index
-
-            match_key = make_match_pair_key(
-                event_type,
-                match_info["map_id"],
-                match_info["user_id"],
-                match_info["opponent_id"],
-            )
-            if match_key not in match_rows_by_key:
-                match_rows_by_key[match_key] = []
-
-            match_rows_by_key[match_key].append(match_info)
+        if event_type != "registration":
             continue
 
-        if is_valid_event(
+        if is_valid_registration_event(row, user_id_to_username, seen_usernames):
+            valid_row_indexes.add(row_index)
+
+    for row_index, row in enumerate(rows):
+        event_type = row.get("event_type") if type(row) is dict else None
+
+        if event_type != "session_ping":
+            continue
+
+        if is_valid_session_ping_event(
             row,
             user_id_to_username,
-            seen_usernames,
             active_session_last_ping_timestamp_by_user_id,
+            ending_session_user_ids,
         ):
             valid_row_indexes.add(row_index)
+
+    for row_index, row in enumerate(rows):
+        event_type = row.get("event_type") if type(row) is dict else None
+
+        if event_type != "match_start" and event_type != "match_finish":
+            continue
+
+        user_id = row.get("user_id")
+        if type(user_id) is str:
+            match_row_count_by_user_id[user_id] = (
+                match_row_count_by_user_id.get(user_id, 0) + 1
+            )
+
+        match_info = get_match_event_info(row, valid_map_ids)
+        if match_info is None:
+            continue
+
+        match_info["event_type"] = event_type
+        match_info["row_index"] = row_index
+
+        match_key = make_match_pair_key(
+            event_type,
+            match_info["map_id"],
+            match_info["user_id"],
+            match_info["opponent_id"],
+        )
+        if match_key not in match_rows_by_key:
+            match_rows_by_key[match_key] = []
+
+        match_rows_by_key[match_key].append(match_info)
 
     for match_rows in match_rows_by_key.values():
         if not is_valid_match_pair(
@@ -375,6 +397,7 @@ def write_valid_rows_for_timestamp_group(
             match_row_count_by_user_id,
             active_match_by_user_id,
             active_session_last_ping_timestamp_by_user_id,
+            ending_session_user_ids,
             user_id_to_username,
         ):
             continue
@@ -383,6 +406,9 @@ def write_valid_rows_for_timestamp_group(
 
         for match_row in match_rows:
             valid_row_indexes.add(match_row["row_index"])
+
+    for user_id in ending_session_user_ids:
+        active_session_last_ping_timestamp_by_user_id.pop(user_id, None)
 
     for row_index, row in enumerate(rows):
         if row_index in valid_row_indexes:
