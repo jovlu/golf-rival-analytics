@@ -1,5 +1,8 @@
 import json
 from pathlib import Path
+from typing import Literal
+
+from pydantic import BaseModel, ConfigDict, StrictInt, StrictStr, ValidationError
 
 from app.pipeline.paths import CLEANED_EVENTS_FILE, DEDUPED_EVENTS_FILE, MAPS_FILE
 
@@ -11,10 +14,76 @@ ALLOWED_EVENT_TYPES = {
     "match_finish",
 }
 
-ALLOWED_DEVICE_OS_VALUES = {"Android", "iOS"}
-ALLOWED_SESSION_PING_STATES = {"started", "in_progress", "ended"}
-ALLOWED_MATCH_OUTCOMES = {0, 0.5, 1}
 SESSION_TIMEOUT_SECONDS = 120
+
+
+class StrictEventModel(BaseModel):
+    model_config = ConfigDict(extra="ignore", strict=True)
+
+
+class RegistrationEventData(StrictEventModel):
+    country: StrictStr
+    username: StrictStr
+    device_os: Literal["Android", "iOS"]
+
+
+class RegistrationEvent(StrictEventModel):
+    id: StrictInt
+    timestamp: StrictInt
+    event_type: Literal["registration"]
+    user_id: StrictStr
+    event_data: RegistrationEventData
+
+
+class SessionPingEventData(StrictEventModel):
+    state: Literal["started", "in_progress", "ended"]
+    device_os: StrictStr
+
+
+class SessionPingEvent(StrictEventModel):
+    id: StrictInt
+    timestamp: StrictInt
+    event_type: Literal["session_ping"]
+    user_id: StrictStr
+    event_data: SessionPingEventData
+
+
+class MatchStartEventData(StrictEventModel):
+    map_id: StrictStr
+    opponent_id: StrictStr
+
+
+class MatchStartEvent(StrictEventModel):
+    id: StrictInt
+    timestamp: StrictInt
+    event_type: Literal["match_start"]
+    user_id: StrictStr
+    event_data: MatchStartEventData
+
+
+class MatchFinishEventData(MatchStartEventData):
+    outcome: Literal[0, 0.5, 1]
+
+
+class MatchFinishEvent(StrictEventModel):
+    id: StrictInt
+    timestamp: StrictInt
+    event_type: Literal["match_finish"]
+    user_id: StrictStr
+    event_data: MatchFinishEventData
+
+
+MATCH_EVENT_MODELS = {
+    "match_start": MatchStartEvent,
+    "match_finish": MatchFinishEvent,
+}
+
+
+def parse_event(row, event_model):
+    try:
+        return event_model.model_validate(row)
+    except ValidationError:
+        return None
 
 
 def load_valid_map_ids(maps_file: Path = MAPS_FILE):
@@ -39,35 +108,18 @@ def load_valid_map_ids(maps_file: Path = MAPS_FILE):
 
 
 def is_valid_registration_event(row, user_id_to_username, seen_usernames):
-    user_id = row.get("user_id")
-    if type(user_id) is not str:
+    event = parse_event(row, RegistrationEvent)
+    if event is None:
         return False
 
-    event_data = row.get("event_data")
-
-    if type(event_data) is not dict:
+    if event.user_id in user_id_to_username:
         return False
 
-    country = event_data.get("country")
-    if type(country) is not str:
+    if event.event_data.username in seen_usernames:
         return False
 
-    username = event_data.get("username")
-    if type(username) is not str:
-        return False
-
-    if user_id in user_id_to_username:
-        return False
-
-    if username in seen_usernames:
-        return False
-
-    device_os = event_data.get("device_os")
-    if device_os not in ALLOWED_DEVICE_OS_VALUES:
-        return False
-
-    user_id_to_username[user_id] = username
-    seen_usernames.add(username)
+    user_id_to_username[event.user_id] = event.event_data.username
+    seen_usernames.add(event.event_data.username)
     return True
 
 
@@ -82,82 +134,55 @@ def has_active_session(user_id, timestamp, active_session_last_ping_timestamp_by
 def is_valid_session_ping_event(
     row, user_id_to_username, active_session_last_ping_timestamp_by_user_id
 ):
-    user_id = row.get("user_id")
-    if type(user_id) is not str:
+    event = parse_event(row, SessionPingEvent)
+    if event is None:
         return False
 
-    if user_id not in user_id_to_username:
-        return False
-
-    event_data = row.get("event_data")
-    if type(event_data) is not dict:
-        return False
-
-    timestamp = row.get("timestamp")
-    if type(timestamp) is not int:
-        return False
-
-    state = event_data.get("state")
-    if state not in ALLOWED_SESSION_PING_STATES:
-        return False
-
-    device_os = event_data.get("device_os")
-    if type(device_os) is not str:
+    if event.user_id not in user_id_to_username:
         return False
 
     session_is_active = has_active_session(
-        user_id, timestamp, active_session_last_ping_timestamp_by_user_id
+        event.user_id,
+        event.timestamp,
+        active_session_last_ping_timestamp_by_user_id,
     )
 
     if not session_is_active:
-        if state != "started":
+        if event.event_data.state != "started":
             return False
 
-        active_session_last_ping_timestamp_by_user_id[user_id] = timestamp
+        active_session_last_ping_timestamp_by_user_id[event.user_id] = event.timestamp
         return True
 
-    if state == "started":
+    if event.event_data.state == "started":
         return False
 
-    if state == "ended":
-        del active_session_last_ping_timestamp_by_user_id[user_id]
+    if event.event_data.state == "ended":
+        del active_session_last_ping_timestamp_by_user_id[event.user_id]
         return True
 
-    active_session_last_ping_timestamp_by_user_id[user_id] = timestamp
+    active_session_last_ping_timestamp_by_user_id[event.user_id] = event.timestamp
     return True
 
 
 def get_match_event_info(row, valid_map_ids):
-    user_id = row.get("user_id")
-    if type(user_id) is not str:
+    event_type = row.get("event_type") if type(row) is dict else None
+    event_model = MATCH_EVENT_MODELS.get(event_type)
+    if event_model is None:
         return None
 
-    event_data = row.get("event_data")
-    if type(event_data) is not dict:
+    event = parse_event(row, event_model)
+    if event is None:
         return None
 
-    map_id = event_data.get("map_id")
-    if map_id not in valid_map_ids:
-        return None
-
-    opponent_id = event_data.get("opponent_id")
-    if type(opponent_id) is not str:
+    if event.event_data.map_id not in valid_map_ids:
         return None
 
     return {
-        "user_id": user_id,
-        "opponent_id": opponent_id,
-        "map_id": map_id,
+        "user_id": event.user_id,
+        "opponent_id": event.event_data.opponent_id,
+        "map_id": event.event_data.map_id,
     }
-
-
-def is_valid_match_finish_outcome(row):
-    event_data = row.get("event_data")
-    if type(event_data) is not dict:
-        return False
-
-    outcome = event_data.get("outcome")
-    return outcome in ALLOWED_MATCH_OUTCOMES
 
 
 def make_match_pair_key(event_type, map_id, user_id, opponent_id):
@@ -288,9 +313,6 @@ def write_valid_rows_for_timestamp_group(
 
             match_info = get_match_event_info(row, valid_map_ids)
             if match_info is None:
-                continue
-
-            if event_type == "match_finish" and not is_valid_match_finish_outcome(row):
                 continue
 
             match_info["event_type"] = event_type
